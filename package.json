@@ -1,6 +1,6 @@
 {
   "name": "cna-aws-cdk-patterns",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "repository": "git://github.com/Accenture/cna-aws-cdk-patterns.git",
   "license": "MIT",
   "main": "index.js",
