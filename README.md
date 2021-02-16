@@ -1,21 +1,4 @@
-# Static Website CDK Construct
-
-This project contains a CDK construct for creating the infrastructure needed for hosting a static website. It also contains templates for CI/CD pipelines for deploying static content and *Single Page Applications* (SPA) to the static website infrastructure.
-
-## Architecture
-
-The infrastructure for hosting consists of the following AWS services:
-
-* AWS S3
-* CloudFront
-* *ACM*
-* *Route 53*
-* *Lambda@Edge*
-
-Additionally, the CI/CD pipelines are based on the following AWS services:
-
-* CodePipeline
-* *CodeBuild*
+# Cloud-native Accelerator: CDK Patterns for AWS
 
 ## Usage
 
@@ -26,6 +9,25 @@ To install this construct to your CDK project you need to run
 ```bash
 npm install @Accenture/cna-aws-cdk-patterns
 ```
+
+
+## Static Website CDK Construct
+
+This project contains a CDK construct for creating the infrastructure needed for hosting a static website. It also contains templates for CI/CD pipelines for deploying static content and *Single Page Applications* (SPA) to the static website infrastructure.
+
+### Architecture
+
+The infrastructure for hosting consists of the following AWS services:
+
+* AWS S3
+* CloudFront
+* ACM
+* Route 53
+
+Additionally, the CI/CD pipelines are based on the following AWS services:
+
+* CodePipeline
+* CodeBuild
 
 ### Create Static Website
 
