@@ -29,6 +29,7 @@
     "@aws-cdk/aws-cloudfront": "^1.89.0",
     "@aws-cdk/aws-cloudfront-origins": "^1.89.0",
     "@aws-cdk/aws-codebuild": "^1.89.0",
+    "@aws-cdk/aws-codedeploy": "^1.95.1",
     "@aws-cdk/aws-codepipeline": "^1.89.0",
     "@aws-cdk/aws-codepipeline-actions": "^1.89.0",
     "@aws-cdk/aws-ec2": "^1.95.1",
