@@ -10,21 +10,43 @@ import {
   PropagatedTagSource,
   NetworkMode,
   Compatibility,
-  ListenerConfig,
+  IEcsLoadBalancerTarget,
 } from "@aws-cdk/aws-ecs";
 import {
   ApplicationLoadBalancer,
   ApplicationTargetGroup,
-  TargetType,
   ApplicationProtocol,
+  ApplicationListener,
+  SslPolicy,
 } from "@aws-cdk/aws-elasticloadbalancingv2";
+import {
+  RecordSet,
+  RecordType,
+  RecordTarget,
+  IHostedZone,
+} from "@aws-cdk/aws-route53";
+import {
+  Certificate,
+  CertificateValidation,
+} from "@aws-cdk/aws-certificatemanager";
 import { Effect, PolicyStatement } from "@aws-cdk/aws-iam";
+import { LoadBalancerTarget } from "@aws-cdk/aws-route53-targets";
 
 interface DockerBackendProps {
   /**
    * The Name of the application
    */
   appName: string;
+  /**
+   * The domain name for the Docker Backend API. It must be matching the Hosted Zone.
+   * This construct will create a new
+   */
+  domainName?: string;
+  /**
+   * The Route 53 Hosted Zone to which the DNS record for the backend should be added.
+   * Additionally, this Hosted Zone will be used for validating the accompanied SSL certificate.
+   */
+  hostedZone?: IHostedZone;
   /**
    * The number of CPU Units for the fargate task.
    * The default value is 512 = 0.5 vCPU
@@ -68,8 +90,12 @@ interface DockerBackendProps {
 export class DockerBackend extends Construct {
   public readonly ecsCluster: Cluster;
   public loadBalancer: ApplicationLoadBalancer;
+  public listener: ApplicationListener;
+  public securityGroup: SecurityGroup;
   public taskDefinition: TaskDefinition;
   public fargateService: FargateService;
+  public albTargetGroup: ApplicationTargetGroup;
+  public albTarget: IEcsLoadBalancerTarget;
 
   private DEFAULT_PORT_PROD: number = 80;
 
@@ -82,12 +108,75 @@ export class DockerBackend extends Construct {
 
     this.ecsCluster = new Cluster(this, props.appName, {
       vpc: vpc,
+      clusterName: props.appName,
     });
 
     this.loadBalancer = new ApplicationLoadBalancer(this, "LoadBalancer", {
       vpc,
       internetFacing: true,
+      loadBalancerName: props.appName,
     });
+
+    this.loadBalancer.addRedirect({
+      sourceProtocol: ApplicationProtocol.HTTP,
+      sourcePort: 80,
+      targetProtocol: ApplicationProtocol.HTTPS,
+      targetPort: 443,
+    });
+
+    /**
+     * if domain name and hosted zone are provided,
+     * we will create a custom ssl certificate and
+     * a route 53 record to forward requests to the alb
+     */
+    if (props.domainName && props.hostedZone) {
+      const certificate = new Certificate(this, "certificate", {
+        domainName: props.domainName,
+        validation: CertificateValidation.fromDns(props.hostedZone),
+      });
+
+      this.listener = this.loadBalancer.addListener("listener", {
+        port: 443, // Exposing via HTTPs only
+        protocol: ApplicationProtocol.HTTPS,
+        certificates: [certificate],
+        sslPolicy: SslPolicy.RECOMMENDED,
+      });
+
+      // Create the DNS record in the Hosted Zone
+      new RecordSet(this, "cloudfront-alias-record", {
+        zone: props.hostedZone,
+        recordName: props.domainName,
+        recordType: RecordType.A,
+        target: RecordTarget.fromAlias(
+          new LoadBalancerTarget(this.loadBalancer)
+        ),
+      });
+    } else {
+      // Add listener with default cert and no custom domain
+      this.listener = this.loadBalancer.addListener("listener", {
+        port: 443, // Exposing via HTTPs only
+        protocol: ApplicationProtocol.HTTPS,
+        sslPolicy: SslPolicy.RECOMMENDED,
+      });
+    }
+
+    /**
+     * We need to have 2 Security Groups here
+     * 1. Security Group to Allow HTTPS traffic to the ALB
+     * 2. To allow HTTP Traffic + container port from ALB to Container
+     */
+    this.securityGroup = new SecurityGroup(this, "FargateSecurityGroup", {
+      securityGroupName: props.appName,
+      vpc: vpc,
+      allowAllOutbound: true,
+    });
+
+    this.securityGroup.addIngressRule(
+      Peer.anyIpv4(),
+      Port.tcp(props.containerPort || this.DEFAULT_PORT_PROD)
+    );
+
+    this.loadBalancer.addSecurityGroup(this.securityGroup);
 
     // Will be replaced by CodeDeploy in CodePipeline
     this.taskDefinition = new TaskDefinition(this, "InitialTaskDefinition", {
@@ -122,23 +211,13 @@ export class DockerBackend extends Construct {
         props.initialContainerImage || ContainerImage.fromRegistry("nginx"),
     });
 
-    const securityGroup = new SecurityGroup(this, "FargateSecurityGroup", {
-      securityGroupName: props.appName,
-      vpc: vpc,
-      allowAllOutbound: true,
-    });
-
-    securityGroup.addIngressRule(
-      Peer.anyIpv4(),
-      Port.tcp(props.containerPort || this.DEFAULT_PORT_PROD)
-    );
-
     this.fargateService = new FargateService(this, "FargateService", {
       cluster: this.ecsCluster,
       taskDefinition: this.taskDefinition,
-      securityGroup,
+      securityGroup: this.securityGroup,
       platformVersion: FargatePlatformVersion.VERSION1_4,
       propagateTags: PropagatedTagSource.SERVICE,
+      serviceName: props.appName,
     });
 
     this.fargateService.connections.allowFrom(
@@ -146,33 +225,32 @@ export class DockerBackend extends Construct {
       Port.tcp(props.containerPort || this.DEFAULT_PORT_PROD)
     );
 
-    const listener = this.loadBalancer.addListener("listener", {
-      port: props.containerPort || this.DEFAULT_PORT_PROD,
-    });
-
-    const TARGET_GROUP_NAME = "targetGroup";
-
-    const targetGroup = new ApplicationTargetGroup(this, TARGET_GROUP_NAME, {
-      port: props.containerPort || this.DEFAULT_PORT_PROD,
-      targetType: TargetType.IP,
-      vpc,
-    });
-
-    listener.addTargetGroups("AddtargetGroup", {
-      targetGroups: [targetGroup],
-    });
-
-    this.fargateService.registerLoadBalancerTargets({
+    this.albTarget = this.fargateService.loadBalancerTarget({
       containerName: props.appName,
       containerPort: props.containerPort || this.DEFAULT_PORT_PROD,
-      newTargetGroupId: TARGET_GROUP_NAME,
-      listener: ListenerConfig.applicationListener(listener, {
+    });
+
+    this.albTargetGroup = this.listener.addTargets(props.appName, {
+      targetGroupName: props.appName,
+      port: props.containerPort || this.DEFAULT_PORT_PROD,
+      targets: [this.albTarget],
+      healthCheck: {
+        enabled: true,
+        path: props.healthCheckPath || "/",
+      },
+    });
+
+    /*this.fargateService.registerLoadBalancerTargets({
+      containerName: props.appName,
+      containerPort: props.containerPort || this.DEFAULT_PORT_PROD,
+      newTargetGroupId: props.appName,
+      listener: ListenerConfig.applicationListener(this.listener, {
         protocol: ApplicationProtocol.HTTPS,
         healthCheck: {
           enabled: true,
           path: props.healthCheckPath || "/",
         },
       }),
-    });
+    });*/
   }
 }
