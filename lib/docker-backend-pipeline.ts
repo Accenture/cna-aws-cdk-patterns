@@ -72,10 +72,10 @@ export class DockerBackendPipeline extends Construct {
             }),
           ],
         },
-        {
+        /*{
           stageName: "Deploy",
           actions: [this.deployAction(deployArtifact, {})], // not in Cfn yet: https://docs.aws.amazon.com/cdk/api/latest/typescript/api/aws-codedeploy/ecsdeploymentgroup.html#aws_codedeploy_EcsDeploymentGroup
-        },
+        },*/
       ],
     });
   }

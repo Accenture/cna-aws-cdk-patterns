@@ -4,6 +4,8 @@ import {
   //haveResource,
   haveResourceLike,
   //SynthUtils,
+  Capture,
+  notMatching,
 } from "@aws-cdk/assert";
 
 import { App, Stack } from "@aws-cdk/core";
@@ -35,10 +37,6 @@ test("has basic resources that are named appropriately", () => {
 
   expect(dockerBackend.ecsCluster.clusterName).toEqual(testParams.appName);
 
-  expect(dockerBackend.securityGroup.securityGroupName).toEqual(
-    testParams.appName
-  );
-
   expect(dockerBackend.loadBalancer.loadBalancerName).toEqual(
     testParams.appName
   );
@@ -60,39 +58,136 @@ describe("has resources to route HTTPS traffic to and from container with defaul
     testParams
   );
 
-  test("ALB redirects HTTP to HTTPs", () => {
+  const albRef = Capture.aString();
+  const albSgRef = Capture.aString();
+  const targetGroupRef = Capture.aString();
+
+  test("Alb is accessable from the internet", () => {
     expectCDK(stack).to(
-      haveResourceLike("AWS::ElasticLoadBalancingV2::ListenerRule", {
-        Actions: [
+      haveResourceLike("AWS::ElasticLoadBalancingV2::LoadBalancer", {
+        Scheme: "internet-facing",
+        SecurityGroups: [
           {
-            Type: "redirect",
-            RedirectConfig: {
-              Host: "#{host}",
-              Path: "/#{path}",
-              Port: 443,
-              Protocol: "HTTPS",
-              Query: "#{query}",
-            },
-            Port: 80,
-            Protocol: "HTTP",
+            "Fn::GetAtt": [albRef.capture(), "GroupId"],
+          },
+        ],
+        Type: "application",
+      })
+    );
+    expectCDK(stack).to(
+      haveResourceLike("AWS::EC2::SecurityGroup", {
+        SecurityGroupEgress: [
+          {
+            CidrIp: "0.0.0.0/0",
+            Description: "Allow all outbound traffic by default",
+            IpProtocol: "-1",
+          },
+        ],
+        SecurityGroupIngress: [
+          {
+            CidrIp: "0.0.0.0/0",
+            FromPort: 443,
+            IpProtocol: "tcp",
+            ToPort: 443,
+          },
+          {
+            CidrIp: "0.0.0.0/0",
+            FromPort: 80,
+            IpProtocol: "tcp",
+            ToPort: 80,
           },
         ],
       })
     );
   });
 
-  test("ALB forwards HTTPs traffic", () => {
+  test("ALB redirects HTTP to HTTPs", () => {
+    expect(dockerBackend.listener.http.loadBalancer.loadBalancerArn).toEqual(
+      dockerBackend.loadBalancer.loadBalancerArn
+    );
+
+    expectCDK(stack).to(
+      haveResourceLike("AWS::ElasticLoadBalancingV2::Listener", {
+        DefaultActions: [
+          {
+            Type: "redirect",
+            RedirectConfig: {
+              Port: 443,
+              Protocol: "HTTPS",
+              StatusCode: "HTTP_301",
+            },
+            Port: 80,
+            Protocol: "HTTP",
+          },
+        ],
+        LoadBalancerArn: {
+          Ref: albRef.capture(),
+        },
+      })
+    );
+  });
+
+  test("ALB forwards HTTPs traffic to TargetGroup", () => {
+    expect(dockerBackend.listener.https.loadBalancer.loadBalancerArn).toEqual(
+      dockerBackend.loadBalancer.loadBalancerArn
+    );
+
     expectCDK(stack).to(
       haveResourceLike("AWS::ElasticLoadBalancingV2::ListenerRule", {
-        Actions: [
+        DefaultActions: [
           {
             Type: "forward",
-            Port: 443,
-            Protocol: "HTTPS",
+            TargetGroupArn: {
+              Ref: targetGroupRef.capture(),
+            },
+          },
+        ],
+        Port: 443,
+        Protocol: "HTTPS",
+        LoadBalancerArn: {
+          Ref: albRef.capturedValue,
+        },
+      })
+    );
+  });
+
+  test("TargetGroup is associated with correct ALB", () => {
+    expect(dockerBackend.albTargetGroup.loadBalancerArns).toContain(
+      dockerBackend.loadBalancer.loadBalancerArn
+    );
+  });
+
+  test("Fargate Service is associated with the TargetGroup", () => {
+    expectCDK(stack).to(
+      haveResourceLike("AWS::ECS::Service", {
+        LaunchType: "FARGATE",
+        LoadBalancers: [
+          {
+            ContainerName: "docker-backend",
+            ContainerPort: 80,
+            TargetGroupArn: {
+              Ref: targetGroupRef.capturedValue,
+            },
           },
         ],
       })
     );
+
+    test("Security Groups are correctly set", () => {
+      expectCDK(stack).to(
+        haveResourceLike("AWS::EC2::SecurityGroupIngress", {
+          IpProtocol: "tcp",
+          FromPort: 80,
+          GroupId: {
+            "Fn::GetAtt": [notMatching(albSgRef.capturedValue), "GroupId"],
+          },
+          SourceSecurityGroupId: {
+            "Fn::GetAtt": [albSgRef.capturedValue, "GroupId"],
+          },
+          ToPort: 80,
+        })
+      );
+    });
   });
 
   /**
