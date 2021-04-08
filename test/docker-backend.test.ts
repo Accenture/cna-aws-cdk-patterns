@@ -1,14 +1,19 @@
+import { ContainerImage } from "@aws-cdk/aws-ecs";
 import { DockerBackend } from "./../lib/docker-backend";
 import {
   expect as expectCDK,
-  //haveResource,
   haveResourceLike,
-  //SynthUtils,
+  countResources,
   Capture,
   notMatching,
+  haveResource,
+  objectLike,
+  stringLike,
+  arrayWith,
 } from "@aws-cdk/assert";
 
-import { App, Stack } from "@aws-cdk/core";
+import { Stack } from "@aws-cdk/core";
+import { HostedZone } from "@aws-cdk/aws-route53";
 
 // test('enforce region us-east-1', () => {
 //   const app = new cdk.App();
@@ -19,37 +24,27 @@ import { App, Stack } from "@aws-cdk/core";
 //   expect(stack).toThrowError();
 // });
 
-test("has basic resources that are named appropriately", () => {
-  const app = new App();
-  const stack = new Stack(app, "test-stack", { env: { region: "us-east-1" } });
+describe("has all nessecary resources", () => {
+  const stack = new Stack();
 
   const testParams = {
     appName: "docker-backend",
+    certificateArn:
+      "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012",
   };
 
-  const dockerBackend = new DockerBackend(
-    stack,
-    "test-docker-backend",
-    testParams
-  );
+  new DockerBackend(stack, "test-docker-backend", testParams);
 
-  expectCDK(stack).to(haveResourceLike("AWS::EC2::VPC"));
-
-  expect(dockerBackend.ecsCluster.clusterName).toEqual(testParams.appName);
-
-  expect(dockerBackend.loadBalancer.loadBalancerName).toEqual(
-    testParams.appName
-  );
-
-  expect(dockerBackend.fargateService.serviceName).toEqual(testParams.appName);
+  runTestsToValidateBasicResources(stack);
 });
 
-describe("has resources to route HTTPS traffic to and from container with default props", () => {
-  const app = new App();
-  const stack = new Stack(app, "test-stack", { env: { region: "us-east-1" } });
+describe("Test minimal parameters with certificateArn", () => {
+  const stack = new Stack();
 
   const testParams = {
     appName: "docker-backend",
+    certificateArn:
+      "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012",
   };
 
   const dockerBackend = new DockerBackend(
@@ -58,6 +53,242 @@ describe("has resources to route HTTPS traffic to and from container with defaul
     testParams
   );
 
+  runTestsToValidateBasicResources(stack);
+  runTestsToValidateTrafficFlow(stack, dockerBackend, 80);
+});
+
+describe("Test minimal parameters with domainName and hostedZone", () => {
+  const stack = new Stack();
+
+  const testParams = {
+    appName: "docker-backend",
+    domainName: "api",
+    hostedZone: new HostedZone(stack, "zone", {
+      zoneName: "docker-backend.io",
+    }),
+  };
+
+  const dockerBackend = new DockerBackend(
+    stack,
+    "test-docker-backend",
+    testParams
+  );
+
+  runTestsToValidateBasicResources(stack);
+
+  test("has route53 records", () => {
+    expectCDK(stack).to(haveResource("AWS::Route53::HostedZone"));
+    expectCDK(stack).to(
+      haveResourceLike("AWS::Route53::RecordSet", {
+        Name:
+          testParams.domainName + "." + testParams.hostedZone.zoneName + ".",
+        Type: "A",
+      })
+    );
+  });
+
+  runTestsToValidateTrafficFlow(stack, dockerBackend, 80);
+});
+
+describe("Test maximal parameters with domainName and hostedZone", () => {
+  const stack = new Stack();
+
+  const imageName = "httpd";
+
+  const testParams = {
+    appName: "docker-backend",
+    domainName: "api",
+    hostedZone: new HostedZone(stack, "zone", {
+      zoneName: "docker-backend.io",
+    }),
+    cpu: 1024,
+    memory: 2048,
+    containerPort: 8080,
+    healthCheckPath: "/healthcheck.html",
+    initialContainerImage: ContainerImage.fromRegistry(imageName),
+  };
+
+  const dockerBackend = new DockerBackend(
+    stack,
+    "test-docker-backend",
+    testParams
+  );
+
+  runTestsToValidateBasicResources(stack);
+
+  test("has route53 records", () => {
+    expectCDK(stack).to(haveResource("AWS::Route53::HostedZone"));
+    expectCDK(stack).to(
+      haveResourceLike("AWS::Route53::RecordSet", {
+        Name:
+          testParams.domainName + "." + testParams.hostedZone.zoneName + ".",
+        Type: "A",
+      })
+    );
+  });
+
+  test("has correct container values for cpu, memory, port and image values", () => {
+    expectCDK(stack).to(
+      haveResourceLike("AWS::ECS::TaskDefinition", {
+        ContainerDefinitions: [
+          {
+            Image: imageName,
+            PortMappings: [
+              {
+                ContainerPort: testParams.containerPort,
+                Protocol: "tcp",
+              },
+            ],
+          },
+        ],
+        Cpu: testParams.cpu.toString(),
+        Memory: testParams.memory.toString(),
+      })
+    );
+  });
+
+  test("has correct healthcheck path and port", () => {
+    expectCDK(stack).to(
+      haveResourceLike("AWS::ElasticLoadBalancingV2::TargetGroup", {
+        HealthCheckEnabled: true,
+        HealthCheckPath: testParams.healthCheckPath,
+        Port: testParams.containerPort,
+        Protocol: "HTTP",
+        TargetType: "ip",
+      })
+    );
+  });
+
+  runTestsToValidateTrafficFlow(stack, dockerBackend, testParams.containerPort);
+});
+
+describe("Test extensions for IAM policies", () => {
+  const stack = new Stack();
+
+  const imageName = "httpd";
+
+  const testParams = {
+    appName: "docker-backend",
+    domainName: "api",
+    hostedZone: new HostedZone(stack, "zone", {
+      zoneName: "docker-backend.io",
+    }),
+    cpu: 1024,
+    memory: 2048,
+    containerPort: 8080,
+    healthCheckPath: "/healthcheck.html",
+    initialContainerImage: ContainerImage.fromRegistry(imageName),
+  };
+
+  const dockerBackend = new DockerBackend(
+    stack,
+    "test-docker-backend",
+    testParams
+  );
+
+  test("No DynamoDB access before enabling it", () => {
+    checkIfStackDoesNotHavePolicy(stack, "dynamodb:*");
+  });
+
+  test("DynamoDb access after enabling it", () => {
+    dockerBackend.enableDynamoDBAccess();
+    checkIfStackHasPolicy(stack, "dynamodb:*");
+  });
+
+  test("No S3 access before enabling it", () => {
+    checkIfStackDoesNotHavePolicy(stack, "s3:*");
+  });
+
+  test("S3 access after enabling it", () => {
+    dockerBackend.enableS3Access();
+    checkIfStackHasPolicy(stack, "s3:*");
+  });
+
+  test("No SQS access before enabling it", () => {
+    checkIfStackDoesNotHavePolicy(stack, "sqs:*");
+  });
+
+  test("SQS access after enabling it", () => {
+    dockerBackend.enableSQSAccess();
+    checkIfStackHasPolicy(stack, "sqs:*");
+  });
+
+  test("No SNS access before enabling it", () => {
+    checkIfStackDoesNotHavePolicy(stack, "sns:*");
+  });
+
+  test("SNS access after enabling it", () => {
+    dockerBackend.enableSNSAccess();
+    checkIfStackHasPolicy(stack, "sns:*");
+  });
+
+  runTestsToValidateBasicResources(stack);
+
+  runTestsToValidateTrafficFlow(stack, dockerBackend, testParams.containerPort);
+});
+
+test("Test with wrong parameters", () => {
+  const stack = new Stack();
+
+  expect(
+    () =>
+      new DockerBackend(stack, "test-docker-backend", {
+        appName: "docker-backend",
+      })
+  ).toThrowError();
+
+  expect(
+    () =>
+      new DockerBackend(stack, "test-docker-backend", {
+        appName: "docker-backend",
+        domainName: "api",
+      })
+  ).toThrowError();
+
+  expect(
+    () =>
+      new DockerBackend(stack, "test-docker-backend", {
+        appName: "docker-backend",
+        hostedZone: new HostedZone(stack, "zone", {
+          zoneName: "docker-backend.io",
+        }),
+      })
+  ).toThrowError();
+});
+
+function runTestsToValidateBasicResources(stack: Stack): void {
+  it("has all nessecary resources", () => {
+    expectCDK(stack).to(countResources("AWS::EC2::VPC", 1));
+    expectCDK(stack).to(haveResource("AWS::EC2::Subnet"));
+    expectCDK(stack).to(haveResource("AWS::EC2::RouteTable"));
+    expectCDK(stack).to(haveResource("AWS::EC2::SubnetRouteTableAssociation"));
+    expectCDK(stack).to(haveResource("AWS::EC2::Route"));
+    expectCDK(stack).to(haveResource("AWS::EC2::NatGateway"));
+    expectCDK(stack).to(haveResource("AWS::EC2::InternetGateway"));
+    expectCDK(stack).to(haveResource("AWS::EC2::VPCGatewayAttachment"));
+    expectCDK(stack).to(countResources("AWS::ECS::Cluster", 1));
+    expectCDK(stack).to(haveResource("AWS::EC2::SecurityGroup"));
+    expectCDK(stack).to(
+      countResources("AWS::ElasticLoadBalancingV2::LoadBalancer", 1)
+    );
+    expectCDK(stack).to(haveResource("AWS::ElasticLoadBalancingV2::Listener"));
+    expectCDK(stack).to(
+      countResources("AWS::ElasticLoadBalancingV2::TargetGroup", 1)
+    );
+    expectCDK(stack).to(haveResource("AWS::IAM::Role"));
+    expectCDK(stack).to(countResources("AWS::ECS::TaskDefinition", 1));
+    expectCDK(stack).to(
+      haveResource("AWS::ApplicationAutoScaling::ScalableTarget")
+    );
+    expectCDK(stack).to(countResources("AWS::ECS::Service", 1));
+  });
+}
+
+function runTestsToValidateTrafficFlow(
+  stack: Stack,
+  dockerBackend: DockerBackend,
+  containerPort: number
+): void {
   const albRef = Capture.aString();
   const albSgRef = Capture.aString();
   const targetGroupRef = Capture.aString();
@@ -67,9 +298,9 @@ describe("has resources to route HTTPS traffic to and from container with defaul
       haveResourceLike("AWS::ElasticLoadBalancingV2::LoadBalancer", {
         Scheme: "internet-facing",
         SecurityGroups: [
-          {
-            "Fn::GetAtt": [albRef.capture(), "GroupId"],
-          },
+          objectLike({
+            "Fn::GetAtt": [albSgRef.capture(), "GroupId"],
+          }),
         ],
         Type: "application",
       })
@@ -112,17 +343,17 @@ describe("has resources to route HTTPS traffic to and from container with defaul
           {
             Type: "redirect",
             RedirectConfig: {
-              Port: 443,
+              Port: "443",
               Protocol: "HTTPS",
               StatusCode: "HTTP_301",
             },
-            Port: 80,
-            Protocol: "HTTP",
           },
         ],
-        LoadBalancerArn: {
+        LoadBalancerArn: objectLike({
           Ref: albRef.capture(),
-        },
+        }),
+        Port: 80,
+        Protocol: "HTTP",
       })
     );
   });
@@ -133,27 +364,21 @@ describe("has resources to route HTTPS traffic to and from container with defaul
     );
 
     expectCDK(stack).to(
-      haveResourceLike("AWS::ElasticLoadBalancingV2::ListenerRule", {
+      haveResourceLike("AWS::ElasticLoadBalancingV2::Listener", {
         DefaultActions: [
-          {
+          objectLike({
             Type: "forward",
             TargetGroupArn: {
               Ref: targetGroupRef.capture(),
             },
-          },
+          }),
         ],
         Port: 443,
         Protocol: "HTTPS",
-        LoadBalancerArn: {
+        LoadBalancerArn: objectLike({
           Ref: albRef.capturedValue,
-        },
+        }),
       })
-    );
-  });
-
-  test("TargetGroup is associated with correct ALB", () => {
-    expect(dockerBackend.albTargetGroup.loadBalancerArns).toContain(
-      dockerBackend.loadBalancer.loadBalancerArn
     );
   });
 
@@ -164,62 +389,65 @@ describe("has resources to route HTTPS traffic to and from container with defaul
         LoadBalancers: [
           {
             ContainerName: "docker-backend",
-            ContainerPort: 80,
-            TargetGroupArn: {
+            ContainerPort: containerPort,
+            TargetGroupArn: objectLike({
               Ref: targetGroupRef.capturedValue,
-            },
+            }),
           },
         ],
       })
     );
-
-    test("Security Groups are correctly set", () => {
-      expectCDK(stack).to(
-        haveResourceLike("AWS::EC2::SecurityGroupIngress", {
-          IpProtocol: "tcp",
-          FromPort: 80,
-          GroupId: {
-            "Fn::GetAtt": [notMatching(albSgRef.capturedValue), "GroupId"],
-          },
-          SourceSecurityGroupId: {
-            "Fn::GetAtt": [albSgRef.capturedValue, "GroupId"],
-          },
-          ToPort: 80,
-        })
-      );
-    });
   });
 
-  /**
-   * (Route53 --> ) ALB --> Listener --> TagetGroup --> Target --> Fargate Service --> Task definition
-   * The problem is that cloudformation works with Refs who's names are random, so we can't test that
-   * I'm trying to use cdk properties to do the assertions but I haven't found all yet.
-   */
+  test("Security Groups are correctly set", () => {
+    expectCDK(stack).to(
+      haveResourceLike("AWS::EC2::SecurityGroupIngress", {
+        IpProtocol: "tcp",
+        FromPort: containerPort,
+        GroupId: objectLike({
+          "Fn::GetAtt": [notMatching(albSgRef.capturedValue), "GroupId"],
+        }),
+        SourceSecurityGroupId: {
+          "Fn::GetAtt": [albSgRef.capturedValue, "GroupId"],
+        },
+        ToPort: containerPort,
+      })
+    );
+  });
+}
 
-  /*
-  other checks:
-  expect(dockerBackend.securityGroup.allowAllOutbound).toBeTruthy();
-
-  expect(dockerBackend.loadBalancer.loadBalancerSecurityGroups[0]).toEqual(
-    dockerBackend.securityGroup.securityGroupId
-  );
-
-  expect(dockerBackend.taskDefinition.isFargateCompatible).toBeTruthy();
-
-  expect(dockerBackend.fargateService.cluster.clusterArn).toEqual(
-    dockerBackend.ecsCluster.clusterArn
-  );
-  expect(dockerBackend.fargateService.taskDefinition.taskDefinitionArn).toEqual(
-    dockerBackend.taskDefinition.taskDefinitionArn
-  );
-  expect(dockerBackend.fargateService.connections.securityGroups[0]).toEqual(
-    dockerBackend.securityGroup.securityGroupId
-  );
-
+function checkIfStackHasPolicy(stack: Stack, action: string): boolean {
   expectCDK(stack).to(
-    haveResourceLike("AWS::ElasticLoadBalancingV2::Listener", {
-      Port: 443,
-      Protocol: "HTTPS",
+    haveResourceLike("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: arrayWith(
+          objectLike({
+            Action: action,
+            Effect: "Allow",
+            Resource: "*",
+          })
+        ),
+      },
     })
-  );*/
-});
+  );
+
+  return true;
+}
+
+function checkIfStackDoesNotHavePolicy(stack: Stack, action: string): boolean {
+  expectCDK(stack).to(
+    haveResourceLike("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: arrayWith(
+          objectLike({
+            Action: notMatching(stringLike(action)),
+            Effect: "Allow",
+            Resource: "*",
+          })
+        ),
+      },
+    })
+  );
+
+  return true;
+}

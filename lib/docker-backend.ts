@@ -14,10 +14,10 @@ import {
   FargateService,
   FargatePlatformVersion,
   PropagatedTagSource,
-  NetworkMode,
-  Compatibility,
   IEcsLoadBalancerTarget,
   ContainerDefinition,
+  FargateTaskDefinition,
+  ScalableTaskCount,
 } from "@aws-cdk/aws-ecs";
 import {
   ApplicationLoadBalancer,
@@ -41,39 +41,40 @@ import { LoadBalancerTarget } from "@aws-cdk/aws-route53-targets";
 
 export interface DockerBackendProps {
   /**
-   * The Name of the application
+   * The name of the application
+   * The name will be reflected in various name tags
    */
   appName: string;
   /**
-   * !!! You must either provide a domainName with a hostedZone or the acmCertificateArn !!!
+   * !!! You must either provide a domainName with a hostedZone or the certificateArn !!!
    *
    * The domain name for the Docker Backend API. It must be matching the Hosted Zone.
    * This construct will create a new
    */
   domainName?: string;
   /**
-   * !!! You must either provide a domainName with a hostedZone or the acmCertificateArn !!!
+   * !!! You must either provide a domainName with a hostedZone or the certificateArn !!!
    *
    * The Route 53 Hosted Zone to which the DNS record for the backend should be added.
    * Additionally, this Hosted Zone will be used for validating the accompanied SSL certificate.
    */
   hostedZone?: IHostedZone;
   /**
-   * !!! You must either provide a domainName with a hostedZone or the acmCertificateArn !!!
+   * !!! You must either provide a domainName with a hostedZone or the certificateArn !!!
    *
    * The ARN of an exsisting SSL Certificate in AWS ACM
    */
-  acmCertificateArn?: string;
+  certificateArn?: string;
   /**
    * The number of CPU Units for the fargate task.
    * The default value is 512 = 0.5 vCPU
    */
-  cpu?: string;
+  cpu?: number;
   /**
    * The memory for the fargate task in MB
    * The default value is 1024
    */
-  memory?: string;
+  memory?: number;
   /**
    * We're going to use blue/green deployments in the pipeline to update the image
    * If you want to, you can define an initial image to work with
@@ -91,18 +92,7 @@ export interface DockerBackendProps {
    * Please remember that healthchecks are performed via HTTP!!!
    */
   healthCheckPath?: string;
-  /**
-   * If the container wants to talk to DynamoDB you need to enable this to assign the necessary policy to the Task Execution Role
-   */
-  enableDynamoDbAccess?: boolean;
 }
-
-/**
- * This should deploy the basic components needed for the pipeline. Including the initial task definition and service
- * We could consider adding an optional repository here and adding the repository as an input to the pipeline
- *
- * TODO: Certificates for ALB. Fargate Scaling
- */
 
 interface DockerBackendTask {
   taskDefinition: TaskDefinition;
@@ -114,21 +104,31 @@ interface DockerBackendListener {
   https: ApplicationListener;
 }
 
+const DEFAULT_PROPS = {
+  appName: "DockerBackend",
+  cpu: 512,
+  memory: 1024,
+  containerPort: 80,
+  healthCheckPath: "/",
+  initialContainerImage: ContainerImage.fromRegistry("nginx"),
+};
+
 export class DockerBackend extends Construct {
   public ecsCluster: Cluster;
   public loadBalancer: ApplicationLoadBalancer;
   public listener: DockerBackendListener;
   public taskDefinition: TaskDefinition;
   public fargateService: FargateService;
+  public scaling: ScalableTaskCount;
   public albTargetGroup: ApplicationTargetGroup;
   public albTarget: IEcsLoadBalancerTarget;
 
-  private DEFAULT_PORT_PROD: number = 80;
-
-  constructor(scope: Construct, id: string, props: DockerBackendProps) {
+  constructor(
+    scope: Construct,
+    id: string,
+    props: DockerBackendProps = DEFAULT_PROPS
+  ) {
     super(scope, id);
-
-    const containerPort = props.containerPort || this.DEFAULT_PORT_PROD;
 
     const vpc = new Vpc(this, "vpc", {
       maxAzs: 3, // Default is all AZs in region, but we wouldn't want 5 AZs to eat up our ip-range just to manage subnets
@@ -145,13 +145,13 @@ export class DockerBackend extends Construct {
       this.loadBalancer,
       props.domainName,
       props.hostedZone,
-      props.acmCertificateArn
+      props.certificateArn
     );
 
     const {
       taskDefinition,
       containerDefinition,
-    } = this.configureEcsTaskDefinition(props, containerPort);
+    } = this.configureEcsTaskDefinition(props);
     this.taskDefinition = taskDefinition;
 
     this.fargateService = new FargateService(this, "fargate-service", {
@@ -160,11 +160,16 @@ export class DockerBackend extends Construct {
       securityGroup: this.configureSecurityGroupForFargateService(
         vpc,
         this.loadBalancer.connections.securityGroups[0], // this is safer than referencing a SG itself because even if the wrong SG is assigned to the ALB fargate will still accept connections from the ALB only
-        props.containerPort || this.DEFAULT_PORT_PROD
+        props.containerPort || DEFAULT_PROPS.containerPort
       ),
       platformVersion: FargatePlatformVersion.VERSION1_4,
       propagateTags: PropagatedTagSource.SERVICE,
       serviceName: props.appName,
+    });
+
+    this.scaling = this.fargateService.autoScaleTaskCount({
+      minCapacity: 2,
+      maxCapacity: 8,
     });
 
     /**
@@ -179,34 +184,34 @@ export class DockerBackend extends Construct {
 
     this.albTargetGroup = this.listener.https.addTargets("fargate-target", {
       targetGroupName: props.appName,
-      port: containerPort,
+      port: props.containerPort || DEFAULT_PROPS.containerPort,
       targets: [this.albTarget],
       healthCheck: {
         enabled: true,
-        path: props.healthCheckPath || "/",
+        path: props.healthCheckPath,
       },
     });
 
     /*
      * This is a more abstract way to hook up Fargate to Alb, however
-     * for testing I was hoping to expose the Target and TargetGroup
-     * Leaving this here if I find a better way to test
+     * I think that exposing the targets and target group will make it easier
+     * to integrate and change the docker-backend in actual projects
      *
     this.fargateService.registerLoadBalancerTargets({
       containerName: props.appName,
-      containerPort: props.containerPort || this.DEFAULT_PORT_PROD,
+      containerPort: props.containerPort,
       newTargetGroupId: props.appName,
       listener: ListenerConfig.applicationListener(this.listener, {
         protocol: ApplicationProtocol.HTTPS,
         healthCheck: {
           enabled: true,
-          path: props.healthCheckPath || "/",
+          path: props.healthCheckPath,
         },
       }),
     });*/
   }
 
-  configureAlb(vpc: Vpc, appName: string): ApplicationLoadBalancer {
+  private configureAlb(vpc: Vpc, appName: string): ApplicationLoadBalancer {
     const albSecurityGroup = new SecurityGroup(this, "alb-sg", {
       vpc: vpc,
       allowAllOutbound: true,
@@ -224,7 +229,7 @@ export class DockerBackend extends Construct {
     return loadBalancer;
   }
 
-  configureAlbListener(
+  private configureAlbListener(
     loadBalancer: ApplicationLoadBalancer,
     domainName?: string,
     hostedZone?: IHostedZone,
@@ -280,7 +285,15 @@ export class DockerBackend extends Construct {
         sslPolicy: SslPolicy.RECOMMENDED,
       });
     } else {
-      throw "parameters dnsName + hostedZone or certificateArn are missing";
+      throw (
+        "parameters domainName(provided value:" +
+        domainName +
+        ") + hostedZone(provided value:" +
+        hostedZone +
+        ") or certificateArn(provided value:" +
+        certificateArn +
+        ") are missing."
+      );
     }
 
     return {
@@ -289,18 +302,18 @@ export class DockerBackend extends Construct {
     };
   }
 
-  configureEcsTaskDefinition(
-    props: DockerBackendProps,
-    containerPort: number
+  private configureEcsTaskDefinition(
+    props: DockerBackendProps = DEFAULT_PROPS
   ): DockerBackendTask {
     // Will be replaced by CodeDeploy in CodePipeline
-    const taskDefinition = new TaskDefinition(this, "initial-task-definition", {
-      networkMode: NetworkMode.AWS_VPC,
-      compatibility: Compatibility.FARGATE,
-      cpu: props.cpu || "512",
-      memoryMiB: props.memory || "1024",
-      family: "blue-green",
-    });
+    const taskDefinition = new FargateTaskDefinition(
+      this,
+      "initial-task-definition",
+      {
+        cpu: props.cpu || DEFAULT_PROPS.cpu,
+        memoryLimitMiB: props.memory || DEFAULT_PROPS.memory,
+      }
+    );
 
     // for ECR and CWL
     taskDefinition.addToExecutionRolePolicy(
@@ -311,22 +324,13 @@ export class DockerBackend extends Construct {
       })
     );
 
-    if (props.enableDynamoDbAccess) {
-      taskDefinition.addToTaskRolePolicy(
-        new PolicyStatement({
-          effect: Effect.ALLOW,
-          resources: ["*"],
-          actions: ["dynamodb:*"],
-        })
-      );
-    }
-
     const containerDefinition = taskDefinition.addContainer(props.appName, {
-      image:
-        props.initialContainerImage || ContainerImage.fromRegistry("nginx"),
+      image: props.initialContainerImage || DEFAULT_PROPS.initialContainerImage,
     });
 
-    containerDefinition.addPortMappings({ containerPort: containerPort });
+    containerDefinition.addPortMappings({
+      containerPort: props.containerPort || DEFAULT_PROPS.containerPort,
+    });
 
     return {
       taskDefinition,
@@ -334,7 +338,7 @@ export class DockerBackend extends Construct {
     };
   }
 
-  configureSecurityGroupForFargateService(
+  private configureSecurityGroupForFargateService(
     vpc: Vpc,
     loadbalancerSG: ISecurityGroup,
     ingressPort: number
@@ -344,7 +348,10 @@ export class DockerBackend extends Construct {
       allowAllOutbound: true,
     });
 
-    fargateSecurityGroup.addIngressRule(loadbalancerSG, Port.tcp(ingressPort));
+    fargateSecurityGroup.addIngressRule(
+      loadbalancerSG,
+      Port.tcp(ingressPort || DEFAULT_PROPS.containerPort)
+    );
 
     // we need to make sure that the ALB is allowed to perform a http healthcheck
     if (ingressPort !== 80) {
@@ -352,5 +359,45 @@ export class DockerBackend extends Construct {
     }
 
     return fargateSecurityGroup;
+  }
+
+  public enableDynamoDBAccess(): void {
+    this.taskDefinition.addToTaskRolePolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        resources: ["*"],
+        actions: ["dynamodb:*"],
+      })
+    );
+  }
+
+  public enableS3Access(): void {
+    this.taskDefinition.addToTaskRolePolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        resources: ["*"],
+        actions: ["s3:*"],
+      })
+    );
+  }
+
+  public enableSQSAccess(): void {
+    this.taskDefinition.addToTaskRolePolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        resources: ["*"],
+        actions: ["sqs:*"],
+      })
+    );
+  }
+
+  public enableSNSAccess(): void {
+    this.taskDefinition.addToTaskRolePolicy(
+      new PolicyStatement({
+        effect: Effect.ALLOW,
+        resources: ["*"],
+        actions: ["sns:*"],
+      })
+    );
   }
 }
